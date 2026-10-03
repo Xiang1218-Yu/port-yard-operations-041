@@ -93,6 +93,18 @@ export type ContainerInput = Omit<Container, 'lastEvent' | 'appointmentId'> & { 
 export type AppointmentInput = Pick<GateAppointment, 'containerId' | 'truckNo' | 'driver' | 'type' | 'windowStart' | 'windowEnd' | 'lane'>;
 export type TaskInput = Pick<YardTask, 'kind' | 'containerId' | 'from' | 'to' | 'priority' | 'scheduledAt' | 'estimatedMinutes'> & { equipmentId?: string };
 
+function parseAppointmentTime(value: string, label: string) {
+  const time = new Date(value).getTime();
+  if (!Number.isFinite(time)) throw new Error(`${label}无效，请使用有效的日期时间`);
+  return time;
+}
+
+function validateAppointmentWindow(windowStart: string, windowEnd: string) {
+  const start = parseAppointmentTime(windowStart, '预约开始时间');
+  const end = parseAppointmentTime(windowEnd, '预约结束时间');
+  if (end <= start) throw new Error('预约结束时间必须晚于开始时间');
+}
+
 function recordAudit(action: string, entity: string, entityId: string, details: string) {
   auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action, entity, entityId, at: new Date().toISOString(), details });
 }
@@ -144,7 +156,7 @@ export function createGateAppointment(input: AppointmentInput) {
   const container = containers.find(item => item.id === input.containerId);
   if (!container) throw new Error('箱号不存在');
   if (input.type === 'pickup' && container.customs !== 'released') throw new Error('海关未放行，不能预约提箱');
-  if (new Date(input.windowEnd) <= new Date(input.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
+  validateAppointmentWindow(input.windowStart, input.windowEnd);
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
   appointments.unshift(item);
   container.appointmentId = item.id;
@@ -156,14 +168,20 @@ export function editGateAppointment(id: string, patch: Partial<AppointmentInput 
   const item = appointments.find(appointment => appointment.id === id);
   if (!item) return undefined;
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('箱号不存在');
-  if (patch.windowStart && patch.windowEnd && new Date(patch.windowEnd) <= new Date(patch.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
+
+  const nextItem = { ...item, ...patch };
+  validateAppointmentWindow(nextItem.windowStart, nextItem.windowEnd);
+
   const previousContainer = containers.find(container => container.id === item.containerId);
+  const nextContainer = containers.find(container => container.id === nextItem.containerId);
+
   Object.assign(item, patch);
-  const nextContainer = containers.find(container => container.id === item.containerId);
   if (previousContainer && previousContainer.id !== nextContainer?.id && previousContainer.appointmentId === id) previousContainer.appointmentId = undefined;
-  if (nextContainer) nextContainer.appointmentId = id;
-  if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
-  if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
+  if (nextContainer) {
+    nextContainer.appointmentId = id;
+    if (item.status === 'checked-in') nextContainer.status = 'at-gate';
+    if (item.status === 'completed') nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
+  }
   recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
   return item;
 }

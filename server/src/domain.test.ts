@@ -13,6 +13,27 @@ test('container create, update and delete form a complete audited CRUD cycle', a
   assert.equal(containers.some(item => item.id === 'TEST-CRUD-0001'), false);
 });
 
+test('editing an appointment validates the complete window and rejects atomic updates', async () => {
+  const { editGateAppointment, appointments, containers, auditEvents } = await import('./domain.js');
+  const before = appointments.find(item => item.id === 'APT-9002');
+  assert.ok(before);
+  const auditCountBefore = auditEvents.length;
+  const invalidStart = new Date(new Date(before.windowEnd).getTime() + 60000).toISOString();
+
+  assert.throws(
+    () => editGateAppointment(before.id, { windowStart: invalidStart, status: 'checked-in', driver: '不应保存的司机' }),
+    /预约结束时间必须晚于开始时间/
+  );
+
+  const after = appointments.find(item => item.id === before.id);
+  assert.equal(after?.windowStart, before.windowStart);
+  assert.equal(after?.windowEnd, before.windowEnd);
+  assert.equal(after?.status, before.status);
+  assert.equal(after?.driver, before.driver);
+  assert.equal(containers.find(item => item.id === before.containerId)?.status, 'in-yard');
+  assert.equal(auditEvents.length, auditCountBefore);
+});
+
 test('appointment and task domain operations support create, update and delete', async () => {
   const { createGateAppointment, editGateAppointment, deleteGateAppointment, createYardTask, updateYardTask, deleteYardTask } = await import('./domain.js');
   const appointment = createGateAppointment({ containerId: 'MSCU-4829017', truckNo: 'TEST-CRUD-01', driver: '测试司机', type: 'pickup', windowStart: new Date(Date.now()+3600000).toISOString(), windowEnd: new Date(Date.now()+7200000).toISOString(), lane: 'north' });
