@@ -61,7 +61,15 @@ export function dashboard() {
 }
 export function gateConflicts() {
   const result: { severity: 'critical' | 'warning'; appointmentId: string; reason: string }[] = [];
-  appointments.forEach((a, index) => appointments.slice(index + 1).forEach(b => {
+  appointments.forEach(appointment => {
+    const start = new Date(appointment.windowStart).getTime();
+    const end = new Date(appointment.windowEnd).getTime();
+    if (!(start < end)) {
+      result.push({ severity: 'critical', appointmentId: appointment.id, reason: `预约 ${appointment.id} 的结束时间必须晚于开始时间，请重新排定时隙` });
+    }
+  });
+  const validAppointments = appointments.filter(a => Number.isFinite(new Date(a.windowStart).getTime()) && Number.isFinite(new Date(a.windowEnd).getTime()) && new Date(a.windowStart).getTime() < new Date(a.windowEnd).getTime());
+  validAppointments.forEach((a, index) => validAppointments.slice(index + 1).forEach(b => {
     const overlap = a.truckNo === b.truckNo && new Date(a.windowStart).getTime() < new Date(b.windowEnd).getTime() && new Date(b.windowStart).getTime() < new Date(a.windowEnd).getTime();
     if (overlap) result.push({ severity: 'critical', appointmentId: a.id, reason: `车辆 ${a.truckNo} 与 ${b.id} 时间窗口重叠，需重新分配闸口时隙` });
   }));
@@ -80,9 +88,22 @@ export function containerPlan(containerId: string) {
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
 export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
+function parseWindowBoundary(value: unknown, label: string): number {
+  const time = typeof value === 'string' ? new Date(value).getTime() : NaN;
+  if (!Number.isFinite(time)) throw new Error(`预约${label}时间格式无效`);
+  return time;
+}
+
+function validateAppointmentWindow(windowStart: unknown, windowEnd: unknown) {
+  const start = parseWindowBoundary(windowStart, '开始');
+  const end = parseWindowBoundary(windowEnd, '结束');
+  if (end <= start) throw new Error('预约结束时间必须晚于开始时间');
+}
+
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
+  validateAppointmentWindow(input.windowStart, input.windowEnd);
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
 export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
@@ -144,7 +165,7 @@ export function createGateAppointment(input: AppointmentInput) {
   const container = containers.find(item => item.id === input.containerId);
   if (!container) throw new Error('箱号不存在');
   if (input.type === 'pickup' && container.customs !== 'released') throw new Error('海关未放行，不能预约提箱');
-  if (new Date(input.windowEnd) <= new Date(input.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
+  validateAppointmentWindow(input.windowStart, input.windowEnd);
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
   appointments.unshift(item);
   container.appointmentId = item.id;
@@ -155,15 +176,27 @@ export function createGateAppointment(input: AppointmentInput) {
 export function editGateAppointment(id: string, patch: Partial<AppointmentInput & Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) {
   const item = appointments.find(appointment => appointment.id === id);
   if (!item) return undefined;
-  if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('箱号不存在');
-  if (patch.windowStart && patch.windowEnd && new Date(patch.windowEnd) <= new Date(patch.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
+
+  const nextContainerId = patch.containerId ?? item.containerId;
+  const nextType = patch.type ?? item.type;
+  if (!nextContainerId) throw new Error('箱号不能为空');
+  const nextContainer = containers.find(container => container.id === nextContainerId);
+  if (!nextContainer) throw new Error('箱号不存在');
+  if ((patch.containerId !== undefined || patch.type !== undefined) && nextType === 'pickup' && nextContainer.customs !== 'released') {
+    throw new Error('海关未放行，不能预约提箱');
+  }
+
+  if (patch.windowStart !== undefined || patch.windowEnd !== undefined) {
+    validateAppointmentWindow(patch.windowStart ?? item.windowStart, patch.windowEnd ?? item.windowEnd);
+  }
+
   const previousContainer = containers.find(container => container.id === item.containerId);
   Object.assign(item, patch);
-  const nextContainer = containers.find(container => container.id === item.containerId);
-  if (previousContainer && previousContainer.id !== nextContainer?.id && previousContainer.appointmentId === id) previousContainer.appointmentId = undefined;
-  if (nextContainer) nextContainer.appointmentId = id;
-  if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
-  if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
+
+  if (previousContainer && previousContainer.id !== nextContainer.id && previousContainer.appointmentId === id) previousContainer.appointmentId = undefined;
+  nextContainer.appointmentId = id;
+  if (item.status === 'checked-in') nextContainer.status = 'at-gate';
+  if (item.status === 'completed') nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
   recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
   return item;
 }
